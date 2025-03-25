@@ -1,5 +1,6 @@
 import {
   OPENAI_API_HOST,
+  OPENAI_DEFAULT_MODEL,
   OPENAI_ORGANIZATION,
   VOCECHAT_BOT_ID,
   VOCECHAT_BOT_SECRET,
@@ -87,7 +88,7 @@ const handler = async (req: Request): Promise<Response> => {
             },
             method: 'POST',
             body: JSON.stringify({
-              model: 'gpt-3.5-turbo',
+              model: OPENAI_DEFAULT_MODEL,
               messages: [
                 {
                   role: 'system',
