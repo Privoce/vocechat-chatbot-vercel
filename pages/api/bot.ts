@@ -6,17 +6,31 @@ import {
   VOCECHAT_BOT_SECRET,
   VOCECHAT_ORIGIN,
 } from '@/utils/app/const';
-
 import { Message } from '@/types/vocechat';
 
 export const config = {
   runtime: 'edge',
 };
 
-const sendMessageToBot = (url: string, message: string) => {
-  // 通过 bot 给 vocechat 发消息
+const isBotMentioned = (message: Message, botId: number): boolean => {
+  const mentions = message.detail.properties?.mentions ?? [];
+  const content = message.detail.content;
+
+  const isMentionedInArray = mentions.some(
+    (id) => id.toString() === botId.toString(),
+  );
+  if (isMentionedInArray) return true;
+
+  const mentionRegex = new RegExp(`@\\s*${botId}(\\b|$)`);
+  const isMentionedInText = mentionRegex.test(content);
+  if (isMentionedInText) return true;
+
+  return false;
+};
+
+const sendMessageToBot = async (url: string, message: string): Promise<void> => {
   try {
-    let resp = fetch(url, {
+    const response = await fetch(url, {
       method: 'POST',
       headers: {
         'content-type': 'text/markdown',
@@ -24,116 +38,87 @@ const sendMessageToBot = (url: string, message: string) => {
       },
       body: message,
     });
-    console.log('bot: send successfully', resp);
+    if (!response.ok) {
+      const errorBody = await response.text();
+      console.error(`bot: Failed to send message to VoceChat. Status: ${response.status}`, errorBody);
+    } else {
+      console.log('bot: Message sent to VoceChat successfully.');
+    }
   } catch (error) {
-    console.error('bot: send failed', url, JSON.stringify(error, null, 2));
+    console.error('bot: Network or other error occurred while sending message.', error);
   }
 };
 
 const handler = async (req: Request): Promise<Response> => {
-  console.log(
-    'bot: from webhook push',
-    req.method,
-    VOCECHAT_BOT_ID,
-    VOCECHAT_ORIGIN,
-    VOCECHAT_BOT_SECRET.slice(-5),
-  );
-  let _url = `${VOCECHAT_ORIGIN}/api/bot/`;
-  let handlerResp: Response | null = null;
-  try {
-    switch (req.method) {
-      case 'GET':
-        handlerResp = new Response(`${req.method}: bot resp`, { status: 200 });
-        break;
-      case 'POST':
-        {
-          const data = (await req.json()) as Message;
-          console.log('bot: handler POST', data);
-          const mentions = (data.detail.properties ?? {}).mentions ?? [];
-          // 机器人本人发的消息不处理
-          if (data.from_uid == VOCECHAT_BOT_ID) {
-            console.log('bot: ignore sent by bot self');
-            handlerResp = new Response(`ignore sent by bot self`, {
-              status: 200,
-            });
-            break;
-          }
-          // 群里没 at 此 bot 的消息不处理
-          if ('gid' in data.target) {
-            const mentionedAtGroup = mentions.some((m) => m == VOCECHAT_BOT_ID);
-            if (!mentionedAtGroup) {
-              console.log('bot: ignore not mention at group');
-              handlerResp = new Response(`ignore not mention at group`, {
-                status: 200,
-              });
-              break;
-            }
-          }
-          // 直接回复该消息
-          _url += `reply/${data.mid}`;
-          // 直接在会话里回复
-          // if ('gid' in data.target) {
-          //     _url += `send_to_group/${data.target.gid}`;
+  if (req.method !== 'POST') {
+    return new Response('Method Not Allowed', { status: 405 });
+  }
 
-          // } else {
-          //     _url += `send_to_user/${data.from_uid}`;
-          // }
-          console.log('bot: start req ChatGPT');
-          // sendMessageToBot(_url, "**正在生成回答，请耐心等待...**");
-          const resp = await fetch(`${OPENAI_API_HOST}/v1/chat/completions`, {
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-              'OpenAI-Organization': OPENAI_ORGANIZATION,
-            },
-            method: 'POST',
-            body: JSON.stringify({
-              model: OPENAI_DEFAULT_MODEL,
-              messages: [
-                {
-                  role: 'system',
-                  content:
-                    "You are ChatGPT, a large language model trained by OpenAI. Follow the user's instructions carefully. Respond using markdown.",
-                },
-                {
-                  role: 'user',
-                  // 去掉 @xxx
-                  content: data.detail.content.replace(/@[0-9]+/g, '').trim(),
-                },
-              ],
-              max_tokens: 1000,
-              temperature: 1,
-              stream: false,
-            }),
-          });
-          const gptData = await resp.json();
-          console.log('bot: gptData', gptData);
-          const [
-            {
-              message: { content },
-            },
-          ] = gptData.choices;
-          console.log('bot: end req ChatGPT', gptData, content, _url);
-          // 通过 bot 给 vocechat 发消息
-          sendMessageToBot(_url, content);
-          handlerResp = new Response(`OK`, { status: 200 });
-        }
-        break;
-      default:
-        {
-          console.log('bot: handler default', req.method);
-          handlerResp = new Response(`${req.method}: bot resp`, {
-            status: 200,
-          });
-        }
-        break;
-    }
-    return handlerResp;
+  let data: Message;
+  try {
+    data = await req.json();
   } catch (error) {
-    console.error('bot: error', error);
-    // 通过 bot 给 vocechat 发消息
-    sendMessageToBot(_url, '**Something Error!**');
-    return new Response(`Error`, { status: 200 });
+    console.error('bot: Failed to parse request JSON.', error);
+    return new Response('Invalid JSON body.', { status: 400 });
+  }
+
+  if (data.from_uid === VOCECHAT_BOT_ID) {
+    return new Response('OK', { status: 200 });
+  }
+
+  if ('gid' in data.target) {
+    if (!isBotMentioned(data, VOCECHAT_BOT_ID)) {
+      return new Response('OK', { status: 200 });
+    }
+  }
+
+  // --- 最终修正：不再区分私聊和群聊，统一使用 reply/{mid} ---
+  const targetUrl = `${VOCECHAT_ORIGIN}/api/bot/reply/${data.mid}`;
+  console.log('bot: Final constructed URL for API call (using reply):', targetUrl);
+
+  try {
+    const userContent = data.detail.content.replace(/@\s*\d+/g, '').trim();
+
+    const openAIResponse = await fetch(`${OPENAI_API_HOST}/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        ...(OPENAI_ORGANIZATION && { 'OpenAI-Organization': OPENAI_ORGANIZATION }),
+      },
+      body: JSON.stringify({
+        model: OPENAI_DEFAULT_MODEL,
+        messages: [
+          { role: 'system', content: "You are ChatGPT, a large language model trained by OpenAI. Respond using markdown." },
+          { role: 'user', content: userContent },
+        ],
+        max_tokens: 8192,
+        temperature: 0.7,
+      }),
+    });
+
+    if (!openAIResponse.ok) {
+      const errorData = await openAIResponse.json();
+      await sendMessageToBot(targetUrl, `**Error from OpenAI:** ${errorData.error?.message || 'Unknown error'}`);
+      return new Response('OK', { status: 200 });
+    }
+
+    const gptData = await openAIResponse.json();
+    const content = gptData.choices?.[0]?.message?.content;
+
+    if (content) {
+      await sendMessageToBot(targetUrl, content);
+    } else {
+      await sendMessageToBot(targetUrl, '**Error:** Received an empty response from the AI.');
+    }
+
+    return new Response('OK', { status: 200 });
+  } catch (error) {
+    console.error('bot: An unexpected error occurred in the handler.', error);
+    if (targetUrl) {
+      await sendMessageToBot(targetUrl, '**Error:** An unexpected error occurred while processing your request.');
+    }
+    return new Response('OK', { status: 200 });
   }
 };
 
